@@ -15,6 +15,7 @@
 #include <vector>
 #include "rasterizer.h"
 #include <cuda_runtime_api.h>
+#include <cuda_fp16.h>
 
 namespace CudaRasterizer
 {
@@ -29,16 +30,16 @@ namespace CudaRasterizer
 	struct GeometryState
 	{
 		size_t scan_size;
-		float* depths;
+		float* depths;					// Per-gaussian depth from the viewing frustum
 		char* scanning_space;
 		bool* clamped;
 		int* internal_radii;
-		float2* means2D;
+		float2* means2D;				// Mean of pixel location (in OpenCV convention) that each Gaussian maps to
 		float* cov3D;
 		float4* conic_opacity;
-		float* rgb;
-		uint32_t* point_offsets;
-		uint32_t* tiles_touched;
+		float* rgb;						// Gaussian-wise RGB color rendered from SHs
+		uint32_t* point_offsets;		// Represent memory offset of tiles touched by each Gaussian
+		uint32_t* tiles_touched;		// number of tiles touched by each Gaussian
 
 		static GeometryState fromChunk(char*& chunk, size_t P);
 	};
@@ -55,10 +56,10 @@ namespace CudaRasterizer
 	struct BinningState
 	{
 		size_t sorting_size;
-		uint64_t* point_list_keys_unsorted;
-		uint64_t* point_list_keys;
-		uint32_t* point_list_unsorted;
-		uint32_t* point_list;
+		uint64_t* point_list_keys_unsorted;		// (num_rendered, )
+		uint64_t* point_list_keys;				// (num_rendered, )
+		uint32_t* point_list_unsorted;			// (num_rendered, )
+		uint32_t* point_list;					// (num_rendered, )
 		char* list_sorting_space;
 
 		static BinningState fromChunk(char*& chunk, size_t P);

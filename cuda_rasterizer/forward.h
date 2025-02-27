@@ -14,6 +14,7 @@
 
 #include <cuda.h>
 #include "cuda_runtime.h"
+#include <cuda_fp16.h>
 #include "device_launch_parameters.h"
 #define GLM_FORCE_CUDA
 #include <glm/glm.hpp>
@@ -52,15 +53,18 @@ namespace FORWARD
 		const dim3 grid, dim3 block,
 		const uint2* ranges,
 		const uint32_t* point_list,
-		int W, int H,
+		int W, int H, bool render_features, bool render_gaussian_idx,
 		const float2* points_xy_image,
 		const float* features,
-		const float* depth,
+		const __half* distill_feats,
+		const float* depths,
 		const float4* conic_opacity,
 		float* final_T,
 		uint32_t* n_contrib,
 		const float* bg_color,
 		float* out_color,
+		__half* out_feat,
+		int* out_gaussian_idx,
 		float* out_depth);
 }
 

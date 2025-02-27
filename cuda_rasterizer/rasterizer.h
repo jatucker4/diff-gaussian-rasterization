@@ -14,6 +14,7 @@
 
 #include <vector>
 #include <functional>
+#include <cuda_fp16.h>
 
 namespace CudaRasterizer
 {
@@ -35,9 +36,12 @@ namespace CudaRasterizer
 			const int P, int D, int M,
 			const float* background,
 			const int width, int height,
+			const bool render_features,
+			const bool render_gaussian_idx,
 			const float* means3D,
 			const float* shs,
 			const float* colors_precomp,
+			const __half* distill_feats,
 			const float* opacities,
 			const float* scales,
 			const float scale_modifier,
@@ -49,6 +53,8 @@ namespace CudaRasterizer
 			const float tan_fovx, float tan_fovy,
 			const bool prefiltered,
 			float* out_color,
+			__half* out_feat,
+			int* out_gaussian_idx,
 			float* out_depth,
 			int* radii = nullptr,
 			bool debug = false);
@@ -57,6 +63,7 @@ namespace CudaRasterizer
 			const int P, int D, int M, int R,
 			const float* background,
 			const int width, int height,
+			const bool render_features,
 			const float* means3D,
 			const float* shs,
 			const float* colors_precomp,
@@ -73,12 +80,13 @@ namespace CudaRasterizer
 			char* binning_buffer,
 			char* image_buffer,
 			const float* dL_dpix,
-			const float* dL_dpix_depth,
+			const __half* dL_dfeat,
+			const float* dL_ddepth,
 			float* dL_dmean2D,
 			float* dL_dconic,
 			float* dL_dopacity,
 			float* dL_dcolor,
-			float* dL_ddepth,
+			__half* dL_ddistill_feats,
 			float* dL_dmean3D,
 			float* dL_dcov3D,
 			float* dL_dsh,

@@ -263,22 +263,31 @@ __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
-	int W, int H,
+	int W, int H, bool render_features, bool render_gaussian_idx,
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
+	const __half* __restrict__ distill_feats,
 	const float* __restrict__ depths,
 	const float4* __restrict__ conic_opacity,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
+	__half* __restrict__ out_feat,
+	int* __restrict__ out_gaussian_idx,
 	float* __restrict__ out_depth)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
+
+	// Compute total number of horizontal blocks; This should be consistent with block.dim.x
 	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+
+	// Min/max pixel idx for this thread block
 	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
 	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
+
+	// Exact pixel id for this thread (each thread is responsible for one and only one pixel)
 	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
 	uint32_t pix_id = W * pix.y + pix.x;
 	float2 pixf = { (float)pix.x, (float)pix.y };
@@ -303,7 +312,11 @@ renderCUDA(
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
-	float D = { 0 };
+
+	__half distill_C[NUM_FEAT_CHANNELS] = { __float2half(0.0f) };
+	uint8_t rendered_gaussian_counter = 0;
+
+	float D = 0.0f;
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -317,9 +330,9 @@ renderCUDA(
 		int progress = i * BLOCK_SIZE + block.thread_rank();
 		if (range.x + progress < range.y)
 		{
-			int coll_id = point_list[range.x + progress];
+			int coll_id = point_list[range.x + progress]; // IDs of the Gaussian
 			collected_id[block.thread_rank()] = coll_id;
-			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
+			collected_xy[block.thread_rank()] = points_xy_image[coll_id]; // pixel coordinates of the Gaussian
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 		}
 		block.sync();
@@ -356,6 +369,22 @@ renderCUDA(
 			// Eq. (3) from 3D Gaussian splatting paper.
 			for (int ch = 0; ch < CHANNELS; ch++)
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
+			
+			__half acc_constant = __float2half(alpha * T);
+			
+			if (render_features) {
+				for (int ch = 0; ch < NUM_FEAT_CHANNELS; ch++) {
+					distill_C[ch] = __hfma(acc_constant, distill_feats[collected_id[j] * NUM_FEAT_CHANNELS + ch], distill_C[ch]);
+				}
+			}
+
+			if (render_gaussian_idx) {
+				if (rendered_gaussian_counter < NUM_GAUSSIAN_LIMIT) {
+					out_gaussian_idx[pix_id * NUM_GAUSSIAN_LIMIT + rendered_gaussian_counter] = collected_id[j];
+					rendered_gaussian_counter++;
+				}
+			}
+
 			D += depths[collected_id[j]] * alpha * T;
 
 			T = test_T;
@@ -368,12 +397,15 @@ renderCUDA(
 
 	// All threads that treat valid pixel write out their final
 	// rendering data to the frame and auxiliary buffers.
-	if (inside)
-	{
+	if (inside) {
 		final_T[pix_id] = T;
 		n_contrib[pix_id] = last_contributor;
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
+		if (render_features) {
+			for (int ch = 0; ch < NUM_FEAT_CHANNELS; ch++)
+				out_feat[pix_id * NUM_FEAT_CHANNELS + ch] = distill_C[ch];  // background feat is default 0
+		}
 		out_depth[pix_id] = D;
 	}
 }
@@ -382,29 +414,35 @@ void FORWARD::render(
 	const dim3 grid, dim3 block,
 	const uint2* ranges,
 	const uint32_t* point_list,
-	int W, int H,
+	int W, int H, bool render_features, bool render_gaussian_idx,
 	const float2* means2D,
 	const float* colors,
+	const __half* distill_feats,
 	const float* depths,
 	const float4* conic_opacity,
 	float* final_T,
 	uint32_t* n_contrib,
 	const float* bg_color,
 	float* out_color,
+	__half* out_feat,
+	int* out_gaussian_idx,
 	float* out_depth)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
+	renderCUDA<NUM_COLOR_CHANNELS> << <grid, block >> > (
 		ranges,
 		point_list,
-		W, H,
+		W, H, render_features, render_gaussian_idx,
 		means2D,
 		colors,
+		distill_feats,
 		depths,
 		conic_opacity,
 		final_T,
 		n_contrib,
 		bg_color,
 		out_color,
+		out_feat,
+		out_gaussian_idx,
 		out_depth);
 }
 
@@ -434,7 +472,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	uint32_t* tiles_touched,
 	bool prefiltered)
 {
-	preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
+	preprocessCUDA<NUM_COLOR_CHANNELS> << <(P + 255) / 256, 256 >> > (
 		P, D, M,
 		means3D,
 		scales,
