@@ -15,9 +15,6 @@
 #include "config.h"
 #include "stdio.h"
 
-#define BLOCK_SIZE (BLOCK_X * BLOCK_Y)
-#define NUM_WARPS (BLOCK_SIZE/32)
-
 // Spherical harmonics coefficients
 __device__ const float SH_C0 = 0.28209479177387814f;
 __device__ const float SH_C1 = 0.4886025119029199f;
@@ -38,11 +35,52 @@ __device__ const float SH_C3[] = {
 	-0.5900435899266435f
 };
 
+// Convert from normalized device coordinates (NDC) to pixel coordinates
+// for more info, copy this function to GPT4 and ask
+// Given that v is the x-component of the homogeneous coordinate and S is the width of the image.
+// What does this function do?
+
+/* Explanation from GPT4:
+
+Given the context that "v" is the x-component of a homogeneous coordinate in normalized device
+coordinate (NDC) space, and "S" is the width of the image in pixels, this function converts
+the x-coordinate from NDC space to screen space (i.e., pixel coordinates).
+
+Here's a step-by-step breakdown:
+
+Normalized Device Coordinates (NDC): In computer graphics, after a 3D point has been
+transformed by the model, view, and projection matrices, it ends up in a space called
+clip space. After performing the perspective divide (dividing by the w-component),
+the point is in NDC space, where each coordinate is typically between -1.0 and 1.0.
+This space is convenient because it's resolution-independent, meaning that the same
+values can be used regardless of the screen's width and height.
+
+The Conversion Process:
+
+The input "v" is an x-coordinate in NDC space. This value is typically in the range [-1.0, 1.0],
+where -1.0 corresponds to the left edge of the screen, and 1.0 corresponds to the right edge.
+The function first maps "v" from the range [-1.0, 1.0] to [0, 2.0] by adding 1.0.
+It then scales this result by the screen width "S", resulting in a value in the range [0, 2S].
+This is because the right edge (v = 1.0 in NDC) should map to the right edge of the screen (x = S in pixels).
+Next, it subtracts 1 from this value, shifting the range to [-1, 2S - 1]. The reason for
+this subtraction is less about the mathematical necessity and more about a practical adjustment,
+likely intended to account for the way pixels are indexed on the screen (with coordinates at pixel centers)
+or other implementation-specific details.
+
+Finally, the function divides the result by 2, scaling the range to [-0.5, (S-1)*0.5].
+This step appears to be a correction to ensure the result aligns with a pixel-centered coordinate system,
+where the center of the leftmost pixel is considered to be (0,0) rather than the top-left corner.
+The result is an x-coordinate in screen space, but instead of the range being [0, S]
+(covering the whole width of the screen from the outer left edge to the outer right edge),
+it's slightly shifted to [-0.5, (S-1)*0.5]. This adjustment is likely because in many graphics systems,
+coordinates are considered to be at the centers of pixels rather than at their top-left corners.
+*/
 __forceinline__ __device__ float ndc2Pix(float v, int S)
 {
 	return ((v + 1.0) * S - 1.0) * 0.5;
 }
 
+// Return the min/max TILE_IDX of the recentangle that point p +- max_radius overlaps
 __forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& rect_min, uint2& rect_max, dim3 grid)
 {
 	rect_min = {

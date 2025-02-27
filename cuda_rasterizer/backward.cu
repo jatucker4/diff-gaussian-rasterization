@@ -401,19 +401,25 @@ __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
-	int W, int H,
+	int W, int H, bool render_features,
 	const float* __restrict__ bg_color,
 	const float2* __restrict__ points_xy_image,
 	const float4* __restrict__ conic_opacity,
 	const float* __restrict__ colors,
+	const float* __restrict__ depths,
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
+	const __half* __restrict__ dL_dfeats,
+	const float* __restrict__ dL_ddepths,
 	float3* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
-	float* __restrict__ dL_dcolors)
+	float* __restrict__ dL_dcolors,
+	__half* __restrict__ dL_ddistill_feats)
 {
+	// Per CUDA documentation, only dynamically allocated shared memory supports >48kb per thread block.
+	__shared__ __half gradient_buffer[FEATURE_SHARED_SIZE * NUM_FEAT_CHANNELS];
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
 	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
@@ -435,6 +441,8 @@ renderCUDA(
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
+	__shared__ float collected_depths[BLOCK_SIZE];
+	__shared__ uint8_t gaussian_use_flags[FEATURE_SHARED_SIZE];  // TODO(roger): can be optimized to use 1 bit per gaussian
 
 	// In the forward, we stored the final value for T, the
 	// product of all (1 - alpha) factors. 
@@ -448,12 +456,51 @@ renderCUDA(
 
 	float accum_rec[C] = { 0 };
 	float dL_dpixel[C];
-	if (inside)
+	__half dL_dfeat[NUM_FEAT_CHANNELS] = { __float2half(0.0f) };
+	float dL_depth;
+	float accum_depth_rec = 0;
+	if (inside) {
 		for (int i = 0; i < C; i++)
 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
+		for (int i = 0; i < NUM_FEAT_CHANNELS; i++)
+			dL_dfeat[i] = dL_dfeats[i * H * W + pix_id];
+		dL_depth = dL_ddepths[pix_id];
+	}
+	bool is_all_loss_zero = true;
+	if (inside) {
+		for (int i = 0; i < C; i++) {
+			if (dL_dpixel[i] != 0) {
+				is_all_loss_zero = false;
+				break;
+			}
+		}
+		if (is_all_loss_zero) {
+			if (dL_depth != 0) {
+				is_all_loss_zero = false;
+			}
+		}
+	}
+	if (is_all_loss_zero)
+		done = true;
+
+	// there is supposed to be an additional buffer for testing if all pixels are done, but we hack collected_id here
+	collected_id[block.thread_rank()] = done;
+	block.sync();
+	// if all pixels are done, return
+	bool all_done = true;
+	for (int i = 0; i < BLOCK_SIZE; i++) {
+		if (collected_id[i] == 0) {
+			all_done = false;
+			break;
+		}
+	}
+	if (all_done) {
+		return;
+	}
 
 	float last_alpha = 0;
 	float last_color[C] = { 0 };
+	float last_depth = 0;
 
 	// Gradient of pixel coordinate w.r.t. normalized 
 	// screen-space viewport corrdinates (-1 to 1)
@@ -464,7 +511,7 @@ renderCUDA(
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
 	{
 		// Load auxiliary data into shared memory, start in the BACK
-		// and load them in revers order.
+		// and load them in reverse order.
 		block.sync();
 		const int progress = i * BLOCK_SIZE + block.thread_rank();
 		if (range.x + progress < range.y)
@@ -475,83 +522,133 @@ renderCUDA(
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 			for (int i = 0; i < C; i++)
 				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
+			collected_depths[block.thread_rank()] = depths[coll_id];
 		}
 		block.sync();
 
 		// Iterate over Gaussians
-		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
-		{
-			// Keep track of current Gaussian ID. Skip, if this one
-			// is behind the last contributor for this pixel.
-			contributor--;
-			if (contributor >= last_contributor)
-				continue;
-
-			// Compute blending values, as before.
-			const float2 xy = collected_xy[j];
-			const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
-			const float4 con_o = collected_conic_opacity[j];
-			const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
-			if (power > 0.0f)
-				continue;
-
-			const float G = exp(power);
-			const float alpha = min(0.99f, con_o.w * G);
-			if (alpha < 1.0f / 255.0f)
-				continue;
-
-			T = T / (1.f - alpha);
-			const float dchannel_dcolor = alpha * T;
-
-			// Propagate gradients to per-Gaussian colors and keep
-			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
-			// pair).
-			float dL_dalpha = 0.0f;
-			const int global_id = collected_id[j];
-			for (int ch = 0; ch < C; ch++)
-			{
-				const float c = collected_colors[ch * BLOCK_SIZE + j];
-				// Update last color (to be used in the next iteration)
-				accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
-				last_color[ch] = c;
-
-				const float dL_dchannel = dL_dpixel[ch];
-				dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
-				// Update the gradients w.r.t. color of the Gaussian. 
-				// Atomic, since this pixel is just one of potentially
-				// many that were affected by this Gaussian.
-				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+		for (int j = 0; j < min(BLOCK_SIZE, toDo); j += FEATURE_SHARED_SIZE) {
+			if (render_features) {
+				if (block.thread_rank() < FEATURE_SHARED_SIZE) {
+					for (int ch = 0; ch < NUM_FEAT_CHANNELS; ch++) {
+						gradient_buffer[block.thread_rank() * NUM_FEAT_CHANNELS + ch] = __float2half(0.0f);
+					}
+					gaussian_use_flags[block.thread_rank()] = 0;
+				}
 			}
-			dL_dalpha *= T;
-			// Update last alpha (to be used in the next iteration)
-			last_alpha = alpha;
+			block.sync();
+			for (int k = j; !done && k < min(j + FEATURE_SHARED_SIZE, toDo); k++) {
+				// Keep track of current Gaussian ID. Skip, if this one
+				// is behind the last contributor for this pixel.
+				contributor--;
+				if (contributor >= last_contributor)
+					continue;
 
-			// Account for fact that alpha also influences how much of
-			// the background color is added if nothing left to blend
-			float bg_dot_dpixel = 0;
-			for (int i = 0; i < C; i++)
-				bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
-			dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
+				// Compute blending values, as before.
+				const float2 xy = collected_xy[k];
+				const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
+				const float4 con_o = collected_conic_opacity[k];
+				const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+				if (power > 0.0f)
+					continue;
+
+				const float G = exp(power);
+				const float alpha = min(0.99f, con_o.w * G);
+				if (alpha < 1.0f / 255.0f)
+					continue;
+
+				T = T / (1.f - alpha);
+				const float dchannel_dcolor = alpha * T;
+
+				// Propagate gradients to per-Gaussian colors and keep
+				// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
+				// pair).
+				float dL_dalpha = 0.0f;
+				const int global_id = collected_id[k];
+				for (int ch = 0; ch < C; ch++)
+				{
+					const float c = collected_colors[ch * BLOCK_SIZE + k];
+					// Update last color (to be used in the next iteration)
+					accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+					last_color[ch] = c;
+
+					const float dL_dchannel = dL_dpixel[ch];
+					dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
+					// Update the gradients w.r.t. color of the Gaussian. 
+					// Atomic, since this pixel is just one of potentially
+					// many that were affected by this Gaussian.
+					atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+				}
+				gaussian_use_flags[k - j] = 1;
+				if (render_features) {
+					const int start_idx = block.thread_rank() % (NUM_FEAT_CHANNELS - 1);
+					int ch_idx = start_idx + 1;
+					while (ch_idx != start_idx) {
+						__half feat_grad = __hmul(__float2half(dchannel_dcolor), dL_dfeat[ch_idx]);
+						atomicAdd((__half*)(&(gradient_buffer[(k - j) * NUM_FEAT_CHANNELS + ch_idx])), feat_grad);
+						if (ch_idx == NUM_FEAT_CHANNELS - 1) {
+							ch_idx = 0;
+						}
+						else {
+							ch_idx++;
+						}
+					}
+				}
+				const float c_d = collected_depths[j];
+				accum_depth_rec = last_alpha * last_depth + (1.f - last_alpha) * accum_depth_rec;
+				last_depth = c_d;
+				dL_dalpha += (c_d - accum_depth_rec) * dL_depth;
+				// for (int ch = 0; ch < NUM_FEAT_CHANNELS; ch++) {  // NUM_FEAT_CHANNELS = 768
+				// 	// same op but no atomic
+				// 	// __hfma(__float2half(dchannel_dcolor), dL_dfeat[ch], gradient_buffer[(k - j) * NUM_FEAT_CHANNELS + ch]);
+
+				// 	// atmoic op; slow
+				// 	__half feat_grad = __hmul(__float2half(dchannel_dcolor), dL_dfeat[ch]);
+				// 	atomicAdd((__half*)(&(gradient_buffer[(k - j) * NUM_FEAT_CHANNELS + ch])), feat_grad);
+				// }
+				dL_dalpha *= T;
+				// Update last alpha (to be used in the next iteration)
+				last_alpha = alpha;
+
+				// Account for fact that alpha also influences how much of
+				// the background color is added if nothing left to blend
+				float bg_dot_dpixel = 0;
+				for (int ch = 0; ch < C; ch++)
+					bg_dot_dpixel += bg_color[ch] * dL_dpixel[ch];
+				dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
 
 
-			// Helpful reusable temporary variables
-			const float dL_dG = con_o.w * dL_dalpha;
-			const float gdx = G * d.x;
-			const float gdy = G * d.y;
-			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
-			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+				// Helpful reusable temporary variables
+				const float dL_dG = con_o.w * dL_dalpha;
+				const float gdx = G * d.x;
+				const float gdy = G * d.y;
+				const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
+				const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
 
-			// Update gradients w.r.t. 2D mean position of the Gaussian
-			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
-			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
+				// Update gradients w.r.t. 2D mean position of the Gaussian
+				atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
+				atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
 
-			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
-			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
-			atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
-			atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
+				// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
+				atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
+				atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
+				atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
 
-			// Update gradients w.r.t. opacity of the Gaussian
-			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
+				// Update gradients w.r.t. opacity of the Gaussian
+				atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
+			}
+			// Write from gradient buffer to global memory
+			block.sync();
+			if (render_features) {
+				if (block.thread_rank() < FEATURE_SHARED_SIZE) {
+					if (gaussian_use_flags[block.thread_rank()] == 1) {
+						for (int ch = 0; ch < NUM_FEAT_CHANNELS; ch++) {
+							atomicAdd((__half*)(&(dL_ddistill_feats[collected_id[j + block.thread_rank()] * NUM_FEAT_CHANNELS + ch])), gradient_buffer[block.thread_rank() * NUM_FEAT_CHANNELS + ch]);
+						}
+					}
+				}
+				block.sync();
+			}
 		}
 	}
 }
@@ -601,7 +698,7 @@ void BACKWARD::preprocess(
 	// Propagate gradients for remaining steps: finish 3D mean gradients,
 	// propagate color gradients to SH (if desireD), propagate 3D covariance
 	// matrix gradients to scale and rotation.
-	preprocessCUDA<NUM_CHANNELS> << < (P + 255) / 256, 256 >> > (
+	preprocessCUDA<NUM_COLOR_CHANNELS> << < (P + 255) / 256, 256 >> > (
 		P, D, M,
 		(float3*)means3D,
 		radii,
@@ -625,33 +722,41 @@ void BACKWARD::render(
 	const dim3 grid, const dim3 block,
 	const uint2* ranges,
 	const uint32_t* point_list,
-	int W, int H,
+	int W, int H, bool render_features,
 	const float* bg_color,
 	const float2* means2D,
 	const float4* conic_opacity,
 	const float* colors,
+	const float* depths,
 	const float* final_Ts,
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
+	const __half* dL_dfeat,
+	const float* dL_ddepth,
 	float3* dL_dmean2D,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
-	float* dL_dcolors)
+	float* dL_dcolors,
+	__half* dL_ddistill_feats)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
+	renderCUDA<NUM_COLOR_CHANNELS> << <grid, block >> >(
 		ranges,
 		point_list,
-		W, H,
+		W, H, render_features,
 		bg_color,
 		means2D,
 		conic_opacity,
 		colors,
+		depths,
 		final_Ts,
 		n_contrib,
 		dL_dpixels,
+		dL_dfeat,
+		dL_ddepth,
 		dL_dmean2D,
 		dL_dconic2D,
 		dL_dopacity,
-		dL_dcolors
+		dL_dcolors,
+		dL_ddistill_feats
 		);
 }

@@ -14,6 +14,7 @@
 
 #include <cuda.h>
 #include "cuda_runtime.h"
+#include <cuda_fp16.h>
 #include "device_launch_parameters.h"
 #define GLM_FORCE_CUDA
 #include <glm/glm.hpp>
@@ -24,18 +25,22 @@ namespace BACKWARD
 		const dim3 grid, dim3 block,
 		const uint2* ranges,
 		const uint32_t* point_list,
-		int W, int H,
+		int W, int H, bool render_features,
 		const float* bg_color,
 		const float2* means2D,
 		const float4* conic_opacity,
 		const float* colors,
+		const float* depths,
 		const float* final_Ts,
 		const uint32_t* n_contrib,
 		const float* dL_dpixels,
+		const __half* dL_dfeat,
+		const float* dL_ddepth,
 		float3* dL_dmean2D,
 		float4* dL_dconic2D,
 		float* dL_dopacity,
-		float* dL_dcolors);
+		float* dL_dcolors,
+		__half* dL_ddistill_feats);
 
 	void preprocess(
 		int P, int D, int M,
